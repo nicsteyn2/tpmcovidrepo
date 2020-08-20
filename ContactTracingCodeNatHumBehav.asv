@@ -1,0 +1,240 @@
+function [AllD, out] = ContactTracingCodeNatHumBehav
+
+P.NRuns = 10;
+P.TEnd = 50;
+P.NGroups = 3;
+
+P.Superspread = 2;
+P.TestToResult = 0.5;
+P.TestMin = 0.5;
+P.PropInfectionsPreSymp = 0.35;
+
+P.GT = 'Weibull';
+
+pTrace = [1.0 0.5 0.0];
+InfIso = [0 0.25 0.5];
+InfQuar = [0 0.25 0.5];
+TraceDays = [1e-6:1:7];
+
+P.pTraced = 0.5*ones(P.NGroups,1);
+P.InfIsol = 0.25;
+P.InfQuar = 0.25;
+P.ParentResultToTrace = 2;
+P = StarterFun(P);
+DoOne(P);
+
+end
+
+function  AllD = DoOne(P)
+
+AllD = [];
+for Run = 1:P.NRuns
+    D = GetSeedCases(P,10);
+    [ExposedTotal(:,Run),ExposedToday(:,Run), ThisD] = GetCommCases(D,P);
+    AllD = [AllD; ThisD];
+    R0 = mean(AllD.Offspring(AllD.Exp<P.TEnd-30));
+end
+R0 = mean(AllD.Offspring(AllD.Exp<P.TEnd-30));
+fprintf('   R0 %.2f\n',R0)
+Clin = AllD.SubClin==0;
+
+end
+
+function [ExposedTotal, ExposedToday, AllD] = GetCommCases(D,P)
+
+DFinished = table;
+C = P.Control(:,1);
+P.Contacts = P.Contacts1;
+ExposedToday = zeros(P.TEnd,1);
+ExposedTotal = ExposedToday;
+P.DT = 0.5;
+for T = 1:P.DT:P.TEnd
+    [D, D1] = OneDay(D,T,C,P);
+    if size(D1,1)>0
+        D = [D; D1];
+    end
+    Done = (T-D.Onset)>20;
+    DFinished = [DFinished; D(Done,:)];
+    D(Done,:) = [];
+    AllD = [DFinished; D];
+    
+    if size(D,1)==0
+        Elim = 1;
+        break;
+    end
+
+end
+ExposedToday = hist(D.Exp,[1:P.TEnd]);
+ExposedTotal = cumsum(ExposedToday);
+
+end
+
+
+function [D, NewD] = OneDay(D,T,C,P)
+
+RClinNow = P.RClin(D.Group).*C(D.Group);
+DailyImports = 0;
+
+% Before quarantine
+XCNotQuar = D.Quar>T & D.SubClin==0;
+% After quarantine & before isolation
+XCQuar = D.Quar<T & D.Isol>T & D.SubClin==0;
+% After isolation
+XCIsol = D.Isol<T & D.SubClin==0;
+
+% Before quarantine
+XSNotQuar = D.Quar>T & D.SubClin==1;
+% After quarantine
+XSQuar = D.Quar<T & D.SubClin==1;
+
+InfRate = XCNotQuar + P.InfQuar*XCQuar + P.InfIsol*XCIsol + P.InfSub*(XSNotQuar + P.InfQuar*XSQuar);
+
+shift = icdf(P.GenerationTimeDistribution,P.PropInfectionsPreSymp);
+TInf = T - (D.Onset-shift);
+x = (D.Onset-shift - D.Exp);
+correction = 1-cdf(P.GenerationTimeDistribution,-x);
+PInf = (cdf(P.GenerationTimeDistribution,TInf) - cdf(P.GenerationTimeDistribution,TInf-P.DT))./correction;
+
+IndR0 = InfRate.*PInf.*RClinNow.*D.beta + 1e-15;
+NewInfections = poissrnd(IndR0);
+D.Offspring = D.Offspring + NewInfections;
+NewInfections = sum(NewInfections);
+
+NewD = table;
+if NewInfections>0
+    NewD.Exp = T - P.DT*rand(NewInfections,1);
+    NewD.Onset = NewD.Exp + random(P.ExpToOnsetDistribution,NewInfections,1);
+    NewD.Test = NewD.Onset + random(P.OnsetToTestDistribution,NewInfections,1);
+    NewD.Result = NewD.Test + P.TestMin + random(P.TestToResultDistribution,NewInfections,1);
+    NewD.Isol = min(NewD.Onset + random(P.OnsetToIsolDistribution,NewInfections,1),NewD.Test);
+    NewD.Quar = NewD.Isol;
+    NewD.Offspring = zeros(NewInfections,1);
+    NewD.Parent = randsample(D.ID,NewInfections,'true',IndR0);
+    NewD.TraceDay = nan(NewInfections,1);
+    for I = 1:NewInfections
+        ParentInd(I,1) = find(D.ID==NewD.Parent(I));
+    end
+    ParentGroup = D.Group(ParentInd);
+    NewD.ParentExp = D.Exp(ParentInd);
+    NewD.ParentOnset = D.Onset(ParentInd);
+    NewD.ParentIsol = D.Isol(ParentInd);
+    NewD.ParentQuar = D.Quar(ParentInd);
+    NewD.ParentTest = D.Test(ParentInd);
+    NewD.ParentResult = D.Result(ParentInd);
+    NewD.ParentTraceDay = D.TraceDay(ParentInd);
+    
+    NewD.Group = zeros(NewInfections,1);
+    for G = 1:P.NGroups
+        tmp = ParentGroup==G;
+        NewD.Group(tmp) = randsample(P.NGroups,sum(tmp),'true',P.Contacts(G,:));
+    end
+    
+    Traced = rand(NewInfections,1)<P.pTraced(NewD.Group);
+    NewD.TraceDay(Traced) = max(NewD.ParentResult(Traced) + random(P.ParentResultToTraceDistribution,sum(Traced),1),NewD.Exp(Traced));
+    NewD.Quar(Traced) = min(NewD.TraceDay(Traced),NewD.Isol(Traced));
+    NewD.Test(Traced) = min(max(NewD.Onset(Traced),NewD.TraceDay(Traced)),NewD.Test(Traced));
+    NewD.Isol(Traced) = min(max(NewD.Onset(Traced),NewD.TraceDay(Traced)),NewD.Isol(Traced));
+    NewD.Result(Traced) = NewD.Test(Traced) + P.TestMin + random(P.TestToResultDistribution,sum(Traced),1);
+
+    NewD.SubClin = rand(NewInfections,1)<P.PSubGroup(NewD.Group);
+    NewD.Isol(NewD.SubClin) = Inf;
+    NewD.Quar(NewD.SubClin & ~Traced) = Inf;
+    NewD.Quar(NewD.SubClin & Traced) = NewD.TraceDay(NewD.SubClin & Traced);
+    NewD.Test(NewD.SubClin) = Inf;
+    NewD.Result(NewD.SubClin) = Inf;
+    
+    NewD.ID = max(D.ID) + [1:length(NewD.Exp)]';
+    if P.Superspread==0
+        NewD.beta = ones(NewInfections,1);
+    elseif P.Superspread>0
+        NewD.beta = random('Gamma',1./P.Superspread,P.Superspread,NewInfections,1);
+    end
+
+    
+end
+end
+
+
+function D = GetSeedCases(P,Cases)
+
+N = Cases;
+D = table;
+D.Exp = ones(N,1);
+D.Onset = D.Exp + random(P.ExpToOnsetDistribution,N,1);
+D.Test = D.Onset + random(P.OnsetToTestDistribution,N,1);
+D.Result = D.Test + P.TestMin + random(P.TestToResultDistribution,N,1);
+D.Isol = D.Test;
+D.Quar = D.Test;
+D.SubClin = zeros(N,1);
+D.Offspring = zeros(N,1);
+
+D.Parent = nan(N,1);
+D.TraceDay = Inf(N,1);
+D.ID = [1:N]';
+D.beta = random('Gamma',1./P.Superspread,P.Superspread,N,1);
+D.ParentExp = nan(N,1);
+D.ParentOnset = nan(N,1);
+D.ParentIsol = nan(N,1);
+D.ParentQuar = nan(N,1);
+D.ParentTest = nan(N,1);
+D.ParentResult = nan(N,1);
+D.ParentTraceDay = nan(N,1);
+
+D.Group = 2*ones(N,1);
+
+if P.Superspread==0
+    D.beta = ones(N,1);
+elseif P.Superspread>0
+    D.beta = random('Gamma',1./P.Superspread,P.Superspread,N,1);
+end
+
+end
+
+function P = StarterFun(P)
+
+% Groups = kids, Grownups, Old
+P.NGroups = 3;
+P.Ages = [0, 18, 65];
+P.Popn = [0.2 0.65 0.15];
+P.PSubGroup = [0.8 0.33 0.2]';
+P.Control = 0.7;
+P.Control = repmat(P.Control,P.NGroups,1);
+
+% Contact matrix at level 1
+P.Contacts1 = repmat(P.Popn,P.NGroups,1) + eye(P.NGroups);
+
+P.InfSub = 0.5;
+
+% P.GT = "Nishiura";
+P.GT = "Weibull";
+% P.GT = "Imperial";
+% P.GT = "Bi";
+
+if P.GT=="Weibull"
+    P.GenerationTimeDistribution = makedist('wbl',5.67,2.83);
+elseif P.GT=="Nishiura"
+    m = 4.7; s = 2.9; v = s^2;
+    P.GenerationTimeDistribution = makedist('logNormal',log(m^2/sqrt(v+m^2)),sqrt(log(v/m^2+1)));
+elseif P.GT=="Imperial"
+    P.GenerationTimeDistribution = makedist('Gamma',6.5/0.62,0.62);
+elseif P.GT=="Bi"
+     P.GenerationTimeDistribution = makedist('Gamma',6.3/2.8,2.8);
+end
+
+NDailyContacts = [25 16 7]';
+P.RClin = NDailyContacts/16*3;
+
+% All cases
+P.ExpToOnsetDistribution = makedist('Gamma',5.8,0.95);
+P.TestToResultDistribution = makedist('Exponential',P.TestToResult);
+
+% Untraced (data - sought healthcare post April 8th)
+P.OnsetToIsolDistribution = makedist('Gamma',0.62,3.47);
+% P.OnsetToTestDistribution = makedist('Exponential',P.OnsetToTest);
+P.OnsetToTestDistribution = makedist('Gamma',1.22,2.17);
+
+% Traced
+% P.ParentResultToTraceDistribution = makedist('Exponential',P.ParentResultToTrace);
+P.ParentResultToTraceDistribution = makedist('Gamma',P.ParentResultToTrace/0.1,0.1);
+
+end
